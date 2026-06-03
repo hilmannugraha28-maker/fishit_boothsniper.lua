@@ -1,10 +1,3 @@
--- ================================================================
---  Fish It! Plaza Booth Sniper v6.0
---  Path: Workspace.Islands.TradePlaza.Booths.Booth.Plane.SurfaceGui
---  Labels: [Label]=price, [Label]=name, [VariantLabel]=variant,
---          [Label]=rarity, [Label]=size, [Label]=weight(kg)
--- ================================================================
-
 local Players         = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
 local HttpService     = game:GetService("HttpService")
