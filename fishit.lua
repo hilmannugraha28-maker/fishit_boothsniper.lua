@@ -1,490 +1,443 @@
--- ═══════════════════════════════════════════════════════════════
---  Fish It! Plaza Booth Sniper v5.0
---  Metode: Hook Replion RemoteEvent → scan SEMUA listing otomatis
---  Tidak ada filter item manual — semua listing terdeteksi
--- ═══════════════════════════════════════════════════════════════
+-- ================================================================
+--  Fish It! Plaza Booth Sniper v6.0
+--  Path: Workspace.Islands.TradePlaza.Booths.Booth.Plane.SurfaceGui
+--  Labels: [Label]=price, [Label]=name, [VariantLabel]=variant,
+--          [Label]=rarity, [Label]=size, [Label]=weight(kg)
+-- ================================================================
 
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService       = game:GetService("HttpService")
-local TeleportService   = game:GetService("TeleportService")
+local Players         = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService     = game:GetService("HttpService")
+local Workspace       = game:GetService("Workspace")
 
 local lp      = Players.LocalPlayer
 local placeId = game.PlaceId
 local jobId   = game.JobId
 
--- ══════════════════════════════
---  CONFIG — edit bagian ini
--- ══════════════════════════════
-local CFG = {
-    WEBHOOK    = "https://discord.com/api/webhooks/1511803435706617907/ISbwuFnRw68XU2qvSgZ3IVCmxCn01jD3hROs_jPDiraWruyBsVzVsIcJF7m7Vy070a6e",
-    HOP        = true,    -- auto pindah server setelah scan
-    SCAN_WAIT  = 10,      -- detik tunggu data Replion masuk sebelum scan
-    HOP_DELAY  = 5,       -- detik sebelum hop
-    MIN_PLAYER = 10,      -- minimal pemain di server tujuan
-    DEBUG      = false,   -- true = print semua listing yang ditemukan
-}
+-- ────────────────────────────────
+--  KONFIGURASI
+-- ────────────────────────────────
+local WEBHOOK    = "https://discord.com/api/webhooks/1511803435706617907/ISbwuFnRw68XU2qvSgZ3IVCmxCn01jD3hROs_jPDiraWruyBsVzVsIcJF7m7Vy070a6e"
+local SCAN_WAIT  = 8
+local HOP        = true
+local HOP_DELAY  = 3
+local MIN_PLAYER = 5
 
--- ══════════════════════════════
+-- ────────────────────────────────
 --  HTTP
--- ══════════════════════════════
+-- ────────────────────────────────
 local httpReq = (syn and syn.request)
     or (http and http.request)
-    or http_request
     or (fluxus and fluxus.request)
+    or http_request
     or request
 
-if not httpReq then
-    warn("[BoothSniper] HTTP tidak tersedia!")
-    return
+if not httpReq then warn("[BoothSniper] HTTP tidak tersedia!"); return end
+
+local function postWebhook(payload)
+    local ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
+    if not ok then
+        print("[Webhook] JSON encode gagal: " .. tostring(body))
+        return
+    end
+    local ok2, res = pcall(httpReq, {
+        Url     = WEBHOOK,
+        Method  = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body    = body,
+    })
+    if not ok2 then
+        print("[Webhook] HTTP request gagal: " .. tostring(res))
+    elseif res and res.StatusCode and res.StatusCode >= 400 then
+        print(("[Webhook] Error %d: %s"):format(res.StatusCode, tostring(res.Body):sub(1, 100)))
+    else
+        print("[Webhook] OK " .. tostring(res and res.StatusCode or "?"))
+    end
 end
 
--- ══════════════════════════════
---  UTILITY
--- ══════════════════════════════
 local function commas(n)
     local s = tostring(math.floor(tonumber(n) or 0))
     return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
 end
 
-local function postWebhook(body)
-    if not CFG.WEBHOOK or CFG.WEBHOOK:find("DISINI") then return end
-    pcall(httpReq, {
-        Url     = CFG.WEBHOOK,
-        Method  = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body    = HttpService:JSONEncode(body),
-    })
-end
-
--- ══════════════════════════════
---  REPLION HOOK
---  Intercept semua RemoteEvent di game
---  dan merge payload-nya ke indexData
--- ══════════════════════════════
-local indexData = {}
-local hooked    = {}
-
-local function mergeTable(dst, src, depth)
-    if type(src) ~= "table" or depth > 12 then return end
-    for k, v in pairs(src) do
-        if type(v) == "table" and type(dst[k]) == "table" then
-            mergeTable(dst[k], v, depth + 1)
-        else
-            dst[k] = v
+-- ────────────────────────────────
+--  PARSER: ambil semua label dari SurfaceGui secara berurutan
+-- ────────────────────────────────
+local function collectOrderedLabels(inst, res, depth)
+    if depth > 15 then return end
+    for _, ch in ipairs(inst:GetChildren()) do
+        if (ch:IsA("TextLabel") or ch:IsA("TextButton")) and ch.Text ~= "" then
+            table.insert(res, { name = ch.Name, text = ch.Text })
         end
+        collectOrderedLabels(ch, res, depth + 1)
     end
 end
 
-local function hookRemote(rem)
-    if hooked[rem] then return end
-    hooked[rem] = true
-    pcall(function()
-        rem.OnClientEvent:Connect(function(...)
-            for _, arg in ipairs({...}) do
-                if type(arg) == "table" then
-                    mergeTable(indexData, arg, 0)
+-- Parse flat label list menjadi item array
+-- Pattern per item: price(Label) → name(Label) → [VariantLabel] → rarity/size/weight(Label)
+local function parseItems(labels, seller)
+    local items = {}
+
+    local function isNumericPrice(tv)
+        local c = tv:gsub(",", "")
+        local n = tonumber(c)
+        return n ~= nil and not tv:lower():find("kg") and n > 0 and n < 10000000
+    end
+
+    local function isWeight(tv)
+        return tv:lower():find("kg") ~= nil
+    end
+
+    local KNOWN_RARITY = {
+        shiny=true, radioactive=true, albino=true, melanistic=true, golden=true,
+        glowing=true, neon=true, special=true, corrupted=true, mythic=true,
+    }
+    local KNOWN_SIZE = {
+        big=true, small=true, tiny=true, colossal=true, giant=true,
+        huge=true, massive=true, mega=true, mini=true, large=true,
+    }
+
+    local i = 1
+    while i <= #labels do
+        local lbl = labels[i]
+
+        -- Cari Label yang berisi harga (angka polos)
+        if lbl.name == "Label" and isNumericPrice(lbl.text) then
+            local price = tonumber((lbl.text:gsub(",", "")))
+            local name, variant, rarity, size, weight
+
+            -- Label berikutnya = nama item (teks, bukan angka, bukan kg)
+            i = i + 1
+            if i <= #labels and labels[i].name == "Label"
+                and not isNumericPrice(labels[i].text)
+                and not isWeight(labels[i].text) then
+                name = labels[i].text
+                i = i + 1
+            end
+
+            -- VariantLabel (opsional, tapi label namanya berbeda)
+            if i <= #labels and labels[i].name == "VariantLabel" then
+                variant = labels[i].text
+                i = i + 1
+            end
+
+            -- Sisa Labels (rarity, size, weight) sampai ketemu harga berikutnya
+            while i <= #labels do
+                local next = labels[i]
+                -- Berhenti jika ini adalah harga item berikutnya
+                if next.name == "Label" and isNumericPrice(next.text) then
+                    break
+                end
+                if next.name == "Label" or next.name == "VariantLabel" then
+                    local tv  = next.text
+                    local tvl = tv:lower()
+                    if isWeight(tv) then
+                        weight = tv
+                    elseif KNOWN_RARITY[tvl] then
+                        rarity = tv
+                    elseif KNOWN_SIZE[tvl] then
+                        size = tv
+                    end
+                end
+                i = i + 1
+            end
+
+            -- Simpan item jika ada nama dan harga
+            if name and price and price > 0 then
+                -- Skip duplikat "Total Sales" (harga terlalu besar tanpa nama item yang valid)
+                local isTotal = (not name:find("%S")) -- nama kosong/spasi saja
+                if not isTotal then
+                    table.insert(items, {
+                        name    = name,
+                        price   = price,
+                        variant = variant or "",
+                        rarity  = rarity or "",
+                        size    = size or "",
+                        weight  = weight or "",
+                        seller  = seller or "Unknown",
+                    })
+                    print(("[ITEM] %s | %s tkn | variant:%s | seller:%s"):format(
+                        name, commas(price), variant or "-", seller or "?"))
                 end
             end
-        end)
-    end)
-end
-
-local function hookTree(parent, depth)
-    if depth > 14 then return end
-    for _, child in ipairs(parent:GetChildren()) do
-        if child:IsA("RemoteEvent") then hookRemote(child) end
-        pcall(hookTree, child, depth + 1)
+        else
+            i = i + 1
+        end
     end
+
+    return items
 end
 
--- Hook semua remote yang sudah ada
-hookTree(game, 0)
+-- ────────────────────────────────
+--  SCAN BOOTHS
+-- ────────────────────────────────
+local function scanBooths()
+    local allItems = {}
+    local _rawPrinted = false
 
--- Watch remote baru yang muncul
-game.DescendantAdded:Connect(function(obj)
-    if obj:IsA("RemoteEvent") then hookRemote(obj) end
-end)
+    -- Navigasi ke TradePlaza.Booths
+    local islands   = Workspace:FindFirstChild("Islands")
+    local tradePlaza = islands and islands:FindFirstChild("TradePlaza")
+    if not tradePlaza then
+        -- Cari rekursif
+        for _, d in ipairs(Workspace:GetDescendants()) do
+            if d.Name == "TradePlaza" then tradePlaza = d; break end
+        end
+    end
 
--- ══════════════════════════════
---  EXTRACT LISTINGS
---  Cari semua entry yang punya field Price + Name
---  di dalam indexData secara rekursif
--- ══════════════════════════════
+    if not tradePlaza then
+        print("[BoothSniper] TradePlaza tidak ditemukan!")
+        return allItems
+    end
 
--- Key-key yang biasa dipakai game Fish It di Replion
-local CONTAINER_KEYS = {
-    "Booths","booths","Booth","booth",
-    "Plaza","plaza","PlazaItems",
-    "Listings","listings","Listing",
-    "Market","market","Marketplace",
-    "Shop","shop","Store","store",
-    "Items","items","ForSale","forsale",
-    "Data","data","PlayerData",
-}
+    local booths = tradePlaza:FindFirstChild("Booths")
+    if not booths then
+        -- Cari langsung di TradePlaza
+        for _, ch in ipairs(tradePlaza:GetChildren()) do
+            if ch.Name:lower():find("booth") then booths = ch; break end
+        end
+    end
 
-local function extractAll(tbl, path, depth, out)
-    if type(tbl) ~= "table" or depth > 16 then return end
+    if not booths then
+        print("[BoothSniper] Folder Booths tidak ditemukan di TradePlaza!")
+        return allItems
+    end
 
-    -- Cek apakah tabel ini adalah listing
-    local price = tonumber(
-        tbl.Price   or tbl.price   or tbl.Cost   or tbl.cost
-        or tbl.Tokens or tbl.tokens or tbl.TokenPrice
-    )
-    local name = tbl.Name or tbl.name or tbl.DisplayName or tbl.displayName
-                 or tbl.ItemName or tbl.itemName
+    print(("[BoothSniper] Scan %d booth..."):format(#booths:GetChildren()))
 
-    if price and price > 0 and name and type(name) == "string" and name ~= "" then
-        local uid = tostring(
-            tbl.UUID or tbl.uuid or tbl.UID or tbl.uid
-            or tbl.ListingId or tbl.listingId or tbl.Id or tbl.id or path
-        )
-        local key = uid.."_"..tostring(price)
-        if not out[key] then
-            out[key] = {
-                uid     = uid,
-                name    = name,
-                price   = price,
-                seller  = tostring(
-                    tbl.Seller or tbl.seller or tbl.Owner or tbl.owner
-                    or tbl.SellerName or tbl.PlayerName or tbl.Username or "Unknown"
-                ),
-                rap     = tonumber(tbl.RAP or tbl.rap or tbl.RecentAveragePrice or 0) or 0,
-                alp     = tonumber(tbl.ALP or tbl.alp or tbl.AvgListedPrice or 0) or 0,
-                alpCnt  = tonumber(tbl.ALPCount or tbl.ListingCount or 0) or 0,
-                variant = tostring(tbl.VariantId or tbl.variantId or tbl.Variant or tbl.variant or ""),
-                rarity  = tostring(tbl.Rarity or tbl.rarity or ""),
-                itype   = tostring(tbl.ItemType or tbl.itemType or tbl.Type or tbl.type or ""),
-                weight  = (function()
-                    if type(tbl.Metadata) == "table" then
-                        return tonumber(tbl.Metadata.Weight or tbl.Metadata.weight or 0) or 0
+    -- Helper: cocokkan "Name's Booth" termasuk Unicode apostrophe (')
+    local function matchBoothOwner(txt)
+        if not txt or txt == "" then return nil end
+        -- ASCII apostrophe
+        local nm = txt:match("^(.+)'s [Bb]ooth")
+        if nm then return nm end
+        -- Unicode right single quote '
+        nm = txt:match("^(.+)\u{2019}s [Bb]ooth")
+        if nm then return nm end
+        -- Just "Booth" suffix
+        nm = txt:match("^(.+) [Bb]ooth$")
+        if nm and #nm > 1 and #nm < 40 then return nm end
+        return nil
+    end
+
+    local _rawPrinted = false
+
+    for _, boothModel in ipairs(booths:GetChildren()) do
+
+        -- ── LANGKAH 1: Cari seller dari SEMUA TextLabel di seluruh booth model ──
+        local seller = nil
+        for _, d in ipairs(boothModel:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" then
+                local nm = matchBoothOwner(d.Text)
+                if nm then seller = nm; break end
+            end
+        end
+        -- Fallback: coba dari nama objek yang ada username pattern
+        if not seller then
+            for _, d in ipairs(boothModel:GetDescendants()) do
+                if d.Name == "OwnerLabel" or d.Name == "Owner" or d.Name == "Username" then
+                    if d:IsA("TextLabel") or d:IsA("TextButton") then
+                        seller = (d.Text:gsub("^@", ""))
+                        if seller ~= "" then break end
                     end
-                    return tonumber(tbl.Weight or tbl.weight or 0) or 0
-                end)(),
-                path    = path,
-            }
-        end
-    end
-
-    -- Rekursi ke container keys terlebih dahulu
-    for _, ck in ipairs(CONTAINER_KEYS) do
-        if type(tbl[ck]) == "table" then
-            extractAll(tbl[ck], path.."."..ck, depth + 1, out)
-        end
-    end
-
-    -- Lalu rekursi ke semua anak (numeric/string key)
-    for k, v in pairs(tbl) do
-        if type(v) == "table" then
-            local ks = tostring(k)
-            -- Hindari double-proses container key
-            local skip = false
-            for _, ck in ipairs(CONTAINER_KEYS) do
-                if ks == ck then skip = true; break end
-            end
-            if not skip then
-                extractAll(v, path.."."..ks, depth + 1, out)
+                end
             end
         end
-    end
-end
 
--- ══════════════════════════════
---  BUILD DISPLAY NAME
--- ══════════════════════════════
-local function displayName(it)
-    local s = it.name
-    if it.variant ~= "" and it.variant ~= "None"
-       and it.variant ~= "Default" and it.variant ~= "0" then
-        s = s.." ["..it.variant.."]"
-    end
-    if it.rarity ~= "" and it.rarity ~= "Common" and it.rarity ~= "0" then
-        s = s.." ("..it.rarity..")"
-    end
-    return s
-end
+        -- ── LANGKAH 2: Cari SurfaceGui item list (Plane face) ──
+        local surfaceGui = nil
+        local plane = boothModel:FindFirstChild("Plane")
+        if plane then
+            surfaceGui = plane:FindFirstChildOfClass("SurfaceGui")
+        end
+        -- Fallback: SurfaceGui dengan paling banyak label
+        if not surfaceGui then
+            local maxLabels = 0
+            for _, d in ipairs(boothModel:GetDescendants()) do
+                if d:IsA("SurfaceGui") then
+                    local cnt = 0
+                    for _, dd in ipairs(d:GetDescendants()) do
+                        if (dd:IsA("TextLabel") or dd:IsA("TextButton")) and dd.Text ~= "" then
+                            cnt = cnt + 1
+                        end
+                    end
+                    if cnt > maxLabels then
+                        maxLabels = cnt
+                        surfaceGui = d
+                    end
+                end
+            end
+        end
 
--- ══════════════════════════════
---  BUILD & SEND DISCORD EMBED
--- ══════════════════════════════
-local sentKeys = {}
+        if not surfaceGui then continue end
 
-local function buildAndSend(items)
-    -- Filter anti-spam: hanya kirim yang belum pernah dikirim
-    local fresh = {}
-    for _, it in ipairs(items) do
-        local k = it.uid.."_"..it.price
-        if not sentKeys[k] then
-            sentKeys[k] = os.clock()
-            table.insert(fresh, it)
+        -- ── LANGKAH 3: Kumpulkan labels dari SurfaceGui ──
+        local labels = {}
+        collectOrderedLabels(surfaceGui, labels, 0)
+        if #labels == 0 then continue end
+
+        -- Seller fallback dari labels jika belum dapat
+        if not seller then
+            for _, lbl in ipairs(labels) do
+                local nm = matchBoothOwner(lbl.text)
+                if nm then seller = nm; break end
+            end
+        end
+        if not seller then seller = "Unknown" end
+
+        -- DEBUG: Print raw label booth pertama
+        if not _rawPrinted then
+            _rawPrinted = true
+            print("\n[RAW] Booth: " .. seller .. " | " .. surfaceGui:GetFullName())
+            for idx, lbl in ipairs(labels) do
+                print(("  [%d] name='%s' text='%s'"):format(idx, lbl.name, lbl.text:sub(1, 50)))
+                if idx >= 30 then print("  ... (truncated)"); break end
+            end
+        end
+
+        -- ── LANGKAH 4: Parse items ──
+        local items = parseItems(labels, seller)
+        for _, it in ipairs(items) do
+            table.insert(allItems, it)
         end
     end
-    if #fresh == 0 then return end
 
-    local joinUrl = ("https://www.roblox.com/games/start?placeId=%d&gameInstanceId=%s"):format(placeId, jobId)
-    local tpScript = ('game:GetService("TeleportService"):TeleportToPlaceInstance(%d,"%s",game.Players.LocalPlayer)'):format(placeId, jobId)
+    return allItems
+end
 
-    local desc = ("**Server:** `%s`\n**Scanner:** @%s\n**Total:** %d listing (≤ %d tokens)\n\n🔗 **[Join Server](%s)**\n```\n%s\n```"):format(
-        jobId:sub(1, 12), lp.Name, #fresh, CFG.MAX_PRICE, joinUrl, tpScript
-    )
 
-    -- Buat fields (max 25 per embed Discord)
-    local allFields = {}
-    for _, it in ipairs(fresh) do
-        local nm     = displayName(it)
-        local rapStr = it.rap > 0 and commas(it.rap) or "N/A"
-        local rapPct = it.rap > 0 and math.floor(it.price / it.rap * 100) or 0
-        local saveStr = it.rap > 0 and commas(it.rap - it.price) or "0"
-        local alpStr = it.alp > 0
-            and (commas(it.alp).." ("..math.floor(it.price / it.alp * 100).."%)")
-            or "N/A"
+-- ────────────────────────────────
+--  KIRIM KE DISCORD
+-- ────────────────────────────────
+local function sendToDiscord(items)
+    if #items == 0 then
+        print("[Discord] Tidak ada item ditemukan")
+        return
+    end
 
-        local typeStr = it.itype ~= "" and ("Type: `%s`\n"):format(it.itype) or ""
+    print(("[Discord] Mengirim %d item ke webhook..."):format(#items))
 
-        table.insert(allFields, {
-            name   = "🔥 SNIPE",
-            value  = ("**%s**\nHarga: `%s` Tokens\nSeller: `%s`\n%sRAP: `%s` (%d%%)\nSave: `%s`\nALP: `%s`"):format(
-                nm, commas(it.price), it.seller, typeStr, rapStr, rapPct, saveStr, alpStr
-            ),
+    local joinUrl  = ("https://www.roblox.com/games/start?placeId=%d&gameInstanceId=%s"):format(placeId, jobId)
+    local tpScript = ('game:GetService("TeleportService"):TeleportToPlaceInstance(%d, "%s", game.Players.LocalPlayer)'):format(placeId, jobId)
+
+    local desc = ("**[Fish It -- Snipe]** Server: %s\nScanner: @%s\nTotal: **%d item**\n[Join Server](%s)\nJoin Script:\n```\n%s\n```"):format(
+        jobId:sub(1, 8), lp.Name, #items, joinUrl, tpScript)
+
+    local footer = ("Fish It Sniper | @%s | PlaceId: %d | %s"):format(lp.Name, placeId, os.date("%d/%m/%Y %H:%M"))
+
+    -- Build fields — semua item tanpa filter
+    local fields = {}
+    for i, it in ipairs(items) do
+        local varStr  = it.variant ~= "" and ("\nVariant: **" .. it.variant .. "**") or ""
+        local rarStr  = it.rarity  ~= "" and (" | " .. it.rarity) or ""
+        local sizeStr = it.size    ~= "" and (it.size .. " ") or ""
+        local wStr    = it.weight  ~= "" and (" | " .. it.weight) or ""
+
+        local val = ("Nama: **%s**%s\nHarga: **%s Tokens**\nSeller: %s\nDetail: %s%s%s"):format(
+            it.name, varStr, commas(it.price), it.seller, sizeStr, rarStr, wStr)
+        table.insert(fields, {
+            name   = "🔥 #" .. i .. " SNIPE",
+            value  = val,
             inline = true,
         })
     end
 
-    -- Kirim dalam batch 25 field per embed
-    local batchSize = 25
-    for i = 1, #allFields, batchSize do
+    -- Kirim per batch 25 field
+    for i = 1, #fields, 25 do
         local batch = {}
-        for j = i, math.min(i + batchSize - 1, #allFields) do
-            table.insert(batch, allFields[j])
+        for j = i, math.min(i + 24, #fields) do
+            table.insert(batch, fields[j])
         end
-
-        local embedTitle = ("🎣 Fish It Booth — %d Item ≤ %d Tokens"):format(#fresh, CFG.MAX_PRICE)
-        if #allFields > batchSize then
-            local page = math.ceil(i / batchSize)
-            local total = math.ceil(#allFields / batchSize)
-            embedTitle = embedTitle..(" [%d/%d]"):format(page, total)
-        end
-
+        local pg = #fields > 25 and (" [" .. math.ceil(i/25) .. "/" .. math.ceil(#fields/25) .. "]") or ""
         postWebhook({
-            username   = "Fish It Booth Sniper",
-            avatar_url = "https://tr.rbxcdn.com/180DAY-"..lp.UserId,
-            embeds     = {{
-                title       = embedTitle,
+            username = "Fish It Booth Sniper",
+            embeds   = {{
+                title       = "[Fish It] Snipe" .. pg,
                 description = (i == 1) and desc or nil,
-                color       = 3066993,
+                color       = 15105570,
                 fields      = batch,
-                footer      = { text = "Fish It Sniper | @"..lp.Name.." | "..os.date("%d/%m %H:%M") },
+                footer      = { text = footer },
             }},
         })
-
-        if i + batchSize <= #allFields then task.wait(1) end
+        if i + 25 <= #fields then task.wait(1) end
     end
 
-    print(("✅ Dikirim %d listing ke Discord"):format(#fresh))
-
-    -- Cleanup sentKeys lama (>10 menit)
-    local now = os.clock()
-    for k, t in pairs(sentKeys) do
-        if now - t > 600 then sentKeys[k] = nil end
-    end
+    print(("[BoothSniper] Terkirim %d item ke Discord"):format(#items))
 end
 
--- ══════════════════════════════
---  SCAN FUNCTION
--- ══════════════════════════════
-local scanNum = 0
 
-local function doScan()
-    scanNum = scanNum + 1
-    print(("\n[SCAN #%d] %s"):format(scanNum, os.date("%H:%M:%S")))
-
-    -- Extract semua listing dari data Replion yang sudah dikumpulkan
-    local found = {}
-    extractAll(indexData, "root", 0, found)
-
-    -- Konversi dict → array (semua listing, tanpa filter harga)
-    local items = {}
-    for _, it in pairs(found) do
-        table.insert(items, it)
-    end
-
-    -- Sort: harga termurah dulu
-    table.sort(items, function(a, b) return a.price < b.price end)
-
-    print(("📦 Dari Replion: %d listing ditemukan"):format(#items))
-
-    if CFG.DEBUG then
-        for i, it in ipairs(items) do
-            print(("  #%d [%s] %s | %s tkn | RAP:%s | seller:%s | path:%s"):format(
-                i, it.itype, it.name, commas(it.price), commas(it.rap), it.seller, it.path:sub(1,60)
-            ))
-        end
-    end
-
-    if #items == 0 then
-        print("⚠️ Tidak ada listing yang cocok. Coba FS.dump() untuk lihat data mentah.")
-        return
-    end
-
-    buildAndSend(items)
-end
-
--- ══════════════════════════════
+-- ────────────────────────────────
 --  SERVER HOP
--- ══════════════════════════════
-local hopNum = 0
-
-local function fetchServers()
-    local list, cursor, pages = {}, "", 0
-    repeat
-        pages = pages + 1
-        local urlFmt = "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&cursor=%s"
-        local url = urlFmt:format(placeId, cursor)
+-- ────────────────────────────────
+local function hopServer()
+    print("[HOP] Mencari server...")
+    local list, cursor = {}, ""
+    for _ = 1, 5 do
+        local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&cursor=%s"):format(placeId, cursor)
         local ok, res = pcall(httpReq, { Url = url, Method = "GET" })
         if not ok or not res then break end
         local ok2, data = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
         if not ok2 or not data or not data.data then break end
         for _, s in ipairs(data.data) do
-            local cnt = s.playing or 0
-            if s.id and s.id ~= jobId and cnt >= CFG.MIN_PLAYER then
-                table.insert(list, { id = s.id, players = cnt, maxPlr = s.maxPlayers or 0 })
+            if s.id and s.id ~= jobId and (s.playing or 0) >= MIN_PLAYER then
+                table.insert(list, { id = s.id, players = s.playing or 0 })
             end
         end
         cursor = data.nextPageCursor or ""
-    until cursor == "" or #list >= 100 or pages >= 5
-    table.sort(list, function(a, b) return a.players > b.players end)
-    return list
-end
-
-local function hopServer()
-    hopNum = hopNum + 1
-    print(("\n[HOP #%d]"):format(hopNum))
-
-    local servers = fetchServers()
-    if #servers == 0 then
-        print("⚠️ Tidak ada server tersedia. Retry 30s...")
-        task.wait(30)
-        return hopServer()
+        if cursor == "" or #list >= 50 then break end
     end
 
-    print(("📋 %d server (min %d players)"):format(#servers, CFG.MIN_PLAYER))
+    if #list == 0 then
+        print("[HOP] Tidak ada server. Retry 30s...")
+        task.wait(30); return hopServer()
+    end
 
-    postWebhook({
-        username = "Fish It Booth Sniper",
-        embeds   = {{
-            title = "🔄 Server Hop #"..hopNum,
-            description = ("**From:** `%s`\n**To:** `%s` (%d players)"):format(
-                jobId:sub(1,12), servers[1].id:sub(1,12), servers[1].players),
-            color  = 15844367,
-            footer = { text = "@"..lp.Name.." • "..os.date("%H:%M:%S") },
-        }},
-    })
+    table.sort(list, function(a, b) return a.players > b.players end)
+    print(("[HOP] %d server, masuk %s (%d players)"):format(#list, list[1].id:sub(1,12), list[1].players))
 
-    for _, srv in ipairs(servers) do
-        task.wait(CFG.HOP_DELAY)
-        print(("  → %s (%d/%d players)"):format(srv.id:sub(1,12), srv.players, srv.maxPlr))
-
-        local failed = false
-        local conn
+    for _, srv in ipairs(list) do
+        task.wait(HOP_DELAY)
+        local failed, conn = false, nil
         pcall(function()
-            conn = TeleportService.TeleportInitFailed:Connect(function(plr)
-                if plr == lp then failed = true end
+            conn = TeleportService.TeleportInitFailed:Connect(function(p)
+                if p == lp then failed = true end
             end)
         end)
-
         local ok = pcall(TeleportService.TeleportToPlaceInstance, TeleportService, placeId, srv.id, lp)
         if ok then
             task.wait(15)
             if conn then pcall(function() conn:Disconnect() end) end
-            if not failed then
-                print("✅ Teleport berhasil!")
-                task.wait(30); return
-            end
+            if not failed then print("[HOP] Berhasil!"); task.wait(30); return end
         end
         if conn then pcall(function() conn:Disconnect() end) end
-        print("  ⚠️ Gagal, coba server lain...")
     end
 
-    print("❌ Semua server gagal. Retry 30s...")
-    task.wait(30)
-    hopServer()
+    print("[HOP] Semua gagal. Retry 30s...")
+    task.wait(30); hopServer()
 end
 
--- ══════════════════════════════
---  QUEUE ON TELEPORT
--- ══════════════════════════════
-local function setupQueue()
-    local url = pcall(function() return getgenv().FISH_SCRIPT_URL end)
-        and getgenv().FISH_SCRIPT_URL or nil
-
-    local qs = url
-        and ('task.wait(5)\nloadstring(game:HttpGet("'..url..'"))()')
-        or 'task.wait(3)\nprint("[FishSniper] Set getgenv().FISH_SCRIPT_URL untuk auto-execute!")'
-
-    local ok = false
-    if queue_on_teleport then pcall(queue_on_teleport, qs); ok = true
-    elseif syn and syn.queue_on_teleport then pcall(syn.queue_on_teleport, qs); ok = true
-    elseif fluxus and fluxus.queue_on_teleport then pcall(fluxus.queue_on_teleport, qs); ok = true
-    end
-    print(ok and "✅ Queue on teleport aktif!" or "⚠️ queue_on_teleport tidak tersedia")
-end
-
--- ══════════════════════════════
---  DEBUG: DUMP DATA MENTAH
--- ══════════════════════════════
-local function dumpIndex()
-    print("\n📂 ══ REPLION DATA DUMP ══")
-    local n = 0
-    local function d(t, pre, depth)
-        if type(t) ~= "table" or depth > 5 then return end
-        for k, v in pairs(t) do
-            n = n + 1; if n > 400 then print("[...truncated]"); return end
-            if type(v) == "table" then
-                print(pre..tostring(k).." {}")
-                d(v, pre.."  ", depth + 1)
-            else
-                print(pre..tostring(k).." = "..tostring(v):sub(1, 80))
-            end
-        end
-    end
-    d(indexData, "  ", 0)
-    print(("══ END (%d entries) ══\n"):format(n))
-end
-
--- ══════════════════════════════
+-- ────────────────────────────────
 --  MAIN
--- ══════════════════════════════
-print("[FishSniper] Fish It! Plaza Booth Sniper v5.0")
-print("[FishSniper] Method : Replion Hook (scan all)")
-print("[FishSniper] Scanner: "..lp.Name)
-print("[FishSniper] Server : "..jobId:sub(1,12))
-print("[FishSniper] AutoHop: "..(CFG.HOP and "ON" or "OFF"))
+-- ────────────────────────────────
+print("[BoothSniper] Fish It Plaza Booth Sniper v6.0")
+print("[BoothSniper] Scanner: " .. lp.Name)
+print("[BoothSniper] Server : " .. jobId:sub(1, 12))
+print("[BoothSniper] Menunggu " .. SCAN_WAIT .. "s...")
 
-setupQueue()
+task.wait(SCAN_WAIT)
 
--- Tunggu data Replion masuk
-print(("\n⏳ Menunggu %ds agar data Replion terisi..."):format(CFG.SCAN_WAIT))
-task.wait(CFG.SCAN_WAIT)
+print("[BoothSniper] Mulai scan booth...")
+local items = scanBooths()
+print(("[BoothSniper] Total: %d item ditemukan"):format(#items))
 
--- Scan 1x lalu langsung hop
-doScan()
+if #items > 0 then
+    sendToDiscord(items)
+else
+    print("[BoothSniper] Tidak ada item. Cek apakah ada booth yang aktif di server ini.")
+end
 
-if CFG.HOP then
-    print("\n🔄 Scan selesai — pindah server...")
+if HOP then
+    print("[BoothSniper] Pindah server...")
     task.wait(2)
     hopServer()
 end
-
--- ══════════════════════════════
---  GLOBAL COMMANDS (F9 Console)
--- ══════════════════════════════
-getgenv().FS = {
-    scan    = doScan,
-    dump    = dumpIndex,
-    hop     = hopServer,
-    webhook = function(u) CFG.WEBHOOK = u; print("[FS] Webhook set") end,
-    debug   = function(v) CFG.DEBUG = v;   print("[FS] Debug: "..tostring(v)) end,
-    hop_on  = function(v) CFG.HOP = v;     print("[FS] AutoHop: "..tostring(v)) end,
-}
-
-print("[FS] Commands: FS.scan() | FS.dump() | FS.hop() | FS.debug(true) | FS.hop_on(false)")
