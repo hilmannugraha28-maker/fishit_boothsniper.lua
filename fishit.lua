@@ -295,8 +295,8 @@ end
 local scanNum = 0
 
 local function doScan()
-    scanNum += 1
-    print(("\n🔍 ══ SCAN #%d ══ [%s]"):format(scanNum, os.date("%H:%M:%S")))
+    scanNum = scanNum + 1
+    print(("\n[SCAN #%d] %s"):format(scanNum, os.date("%H:%M:%S")))
 
     -- Extract semua listing dari data Replion yang sudah dikumpulkan
     local found = {}
@@ -337,8 +337,9 @@ local hopNum = 0
 local function fetchServers()
     local list, cursor, pages = {}, "", 0
     repeat
-        pages += 1
-        local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&cursor=%s"):format(placeId, cursor)
+        pages = pages + 1
+        local urlFmt = "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&cursor=%s"
+        local url = urlFmt:format(placeId, cursor)
         local ok, res = pcall(httpReq, { Url = url, Method = "GET" })
         if not ok or not res then break end
         local ok2, data = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
@@ -356,8 +357,8 @@ local function fetchServers()
 end
 
 local function hopServer()
-    hopNum += 1
-    print(("\n🔄 ══ HOP #%d ══"):format(hopNum))
+    hopNum = hopNum + 1
+    print(("\n[HOP #%d]"):format(hopNum))
 
     local servers = fetchServers()
     if #servers == 0 then
@@ -437,7 +438,7 @@ local function dumpIndex()
     local function d(t, pre, depth)
         if type(t) ~= "table" or depth > 5 then return end
         for k, v in pairs(t) do
-            n += 1; if n > 400 then print("[...truncated]"); return end
+            n = n + 1; if n > 400 then print("[...truncated]"); return end
             if type(v) == "table" then
                 print(pre..tostring(k).." {}")
                 d(v, pre.."  ", depth + 1)
@@ -453,14 +454,11 @@ end
 -- ══════════════════════════════
 --  MAIN
 -- ══════════════════════════════
-print("🐟 ═════════════════════════════════")
-print("🐟  Fish It! Plaza Booth Sniper v5.0")
-print("🐟  Method : Replion Hook (auto scan all)")
-print("🐟  Scanner: "..lp.Name)
-print("🐟  Server : "..jobId:sub(1,12))
-print("🐟  MaxPrice: "..CFG.MAX_PRICE.." tokens")
-print("🐟  AutoHop: "..(CFG.HOP and "ON" or "OFF"))
-print("🐟 ═════════════════════════════════")
+print("[FishSniper] Fish It! Plaza Booth Sniper v5.0")
+print("[FishSniper] Method : Replion Hook (scan all)")
+print("[FishSniper] Scanner: "..lp.Name)
+print("[FishSniper] Server : "..jobId:sub(1,12))
+print("[FishSniper] AutoHop: "..(CFG.HOP and "ON" or "OFF"))
 
 setupQueue()
 
@@ -484,17 +482,9 @@ getgenv().FS = {
     scan    = doScan,
     dump    = dumpIndex,
     hop     = hopServer,
-    webhook = function(url) CFG.WEBHOOK = url;      print("✅ Webhook: "..url:sub(1,40)) end,
-    price   = function(n)   CFG.MAX_PRICE = n;      print("✅ MaxPrice: "..n.." tokens") end,
-    debug   = function(v)   CFG.DEBUG = v;          print("✅ Debug: "..tostring(v)) end,
-    hop_on  = function(v)   CFG.HOP = v;            print("✅ AutoHop: "..tostring(v)) end,
+    webhook = function(u) CFG.WEBHOOK = u; print("[FS] Webhook set") end,
+    debug   = function(v) CFG.DEBUG = v;   print("[FS] Debug: "..tostring(v)) end,
+    hop_on  = function(v) CFG.HOP = v;     print("[FS] AutoHop: "..tostring(v)) end,
 }
 
-print("\n💡 Commands (F9):")
-print('   FS.webhook("URL")  → set webhook Discord')
-print("   FS.scan()          → scan manual")
-print("   FS.dump()          → lihat data Replion mentah")
-print("   FS.hop()           → pindah server manual")
-print("   FS.price(3000)     → ubah max price")
-print("   FS.debug(true)     → print semua listing")
-print("   FS.hop_on(false)   → matikan auto hop")
+print("[FS] Commands: FS.scan() | FS.dump() | FS.hop() | FS.debug(true) | FS.hop_on(false)")
