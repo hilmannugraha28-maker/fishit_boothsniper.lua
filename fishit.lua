@@ -434,4 +434,3 @@ if HOP then
     task.wait(2)
     hopServer()
 end
-a
